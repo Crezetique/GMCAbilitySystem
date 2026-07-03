@@ -20,6 +20,8 @@
 #include "Kismet/KismetSystemLibrary.h"
 #include "Net/UnrealNetwork.h"
 #include "TimerManager.h"
+#include "HAL/IConsoleManager.h"
+#include "GameFramework/Pawn.h"
 
 namespace GMASApplyTrace {
 	// Diagnostic: dump full C++ + script callstack on every ApplyAbilityEffect that creates a
@@ -102,6 +104,33 @@ void UGMC_AbilitySystemComponent::RemoveAttributeChangeDelegate(FDelegateHandle 
 	NativeAttributeChangeDelegate.Remove(Handle);
 }
 
+#if !UE_BUILD_SHIPPING
+// Beautiful Light diagnostic: resolves a "[BLMoveEnqueue] ... Float[N]" index (logged by GMC's BL.GMC.LogMoveEnqueue)
+// to the GMAS attribute it belongs to, for the local player's ability component. Float[BoundIndex] = <tag> Value;
+// Float[BoundIndex+1] = <tag> RawValue. An index that matches no attribute is a GMC/movement bind (montage, ladder, ...).
+static FAutoConsoleCommandWithWorld GBLDumpAttrBindMap(
+	TEXT("BL.GMAS.DumpAttrBindMap"),
+	TEXT("Logs the GMC bound-Float index -> GMAS attribute tag map for the local player (interprets [BLMoveEnqueue] Float[N])."),
+	FConsoleCommandWithWorldDelegate::CreateLambda([](UWorld* World)
+	{
+		const APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+		const APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+		const UGMC_AbilitySystemComponent* ASC = Pawn ? Pawn->FindComponentByClass<UGMC_AbilitySystemComponent>() : nullptr;
+		if (!ASC)
+		{
+			UE_LOG(LogGMCAbilitySystem, Warning, TEXT("[BLMoveEnqueue] DumpAttrBindMap: no local player ability component found."));
+			return;
+		}
+		UE_LOG(LogGMCAbilitySystem, Log, TEXT("[BLMoveEnqueue] --- Bound Float index -> attribute map (%s) ---"), *GetNameSafe(Pawn));
+		for (const FAttribute& Attr : ASC->BoundAttributes.Attributes)
+		{
+			UE_LOG(LogGMCAbilitySystem, Log, TEXT("[BLMoveEnqueue] Float[%d]=%s (Value), Float[%d]=%s (RawValue) [combineMode=%d]"),
+				Attr.BoundIndex, *Attr.Tag.ToString(), Attr.BoundIndex + 1, *Attr.Tag.ToString(), static_cast<int32>(Attr.ValueCombineMode));
+		}
+	})
+);
+#endif
+
 void UGMC_AbilitySystemComponent::BindReplicationData()
 {
 	// Attribute Binds
@@ -111,15 +140,18 @@ void UGMC_AbilitySystemComponent::BindReplicationData()
 	// We sort our attributes alphabetically by tag so that it's deterministic.
 	for (auto& AttributeForBind : BoundAttributes.Attributes)
 	{
+		// Combine mode is per-attribute (FAttributeData::ValueCombineMode, default CombineIfUnchanged). An attribute
+		// that changes every prediction tick (e.g. Stamina drain/regen) and does NOT feed movement can opt into
+		// AlwaysCombineOverwrite to stop defeating GMC move-combining. Applied to both Value and RawValue.
 		AttributeForBind.BoundIndex = GMCMovementComponent->BindSinglePrecisionFloat(AttributeForBind.Value,
 			EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
-			EGMC_CombineMode::CombineIfUnchanged,
+			AttributeForBind.ValueCombineMode,
 			EGMC_SimulationMode::Periodic_Output,
 			EGMC_InterpolationFunction::TargetValue);
 
 		GMCMovementComponent->BindSinglePrecisionFloat(AttributeForBind.RawValue,
 		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
-		EGMC_CombineMode::CombineIfUnchanged,
+		AttributeForBind.ValueCombineMode,
 		EGMC_SimulationMode::Periodic_Output,
 		EGMC_InterpolationFunction::TargetValue);
 	}
@@ -199,10 +231,18 @@ void UGMC_AbilitySystemComponent::GenAncillaryTick(float DeltaTime, bool bIsComb
 	bInAncillaryTick = true;
 
 	// Drain any PredictedQueued operations buffered since the last tick.
-	DrainPendingPredictedOperations();
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Anc_DrainPredictedOps)
+		DrainPendingPredictedOperations();
+	}
 
-	OnAncillaryTick.Broadcast(DeltaTime);
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Anc_OnAncillaryTick_Broadcast)
+		OnAncillaryTick.Broadcast(DeltaTime);
+	}
 
+	{
+	TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Anc_ProcessOperation)
 	if (HasAuthority())
 	{
 		// Server processes client output payloads — only for REMOTE client pawns.
@@ -214,8 +254,17 @@ void UGMC_AbilitySystemComponent::GenAncillaryTick(float DeltaTime, bool bIsComb
 		if (GMCMovementComponent->IsPlayerControlledPawn() && !GMCMovementComponent->IsLocallyControlledServerPawn())
 		{
 			const FGMC_PawnState OutputState = GMCMovementComponent->SV_GetLastClientData().OutputState;
-			const FInstancedStruct ClientPayloadOperationData = GMCMovementComponent->GetBoundInstancedStruct(BoundQueueV2.BI_OperationData, OutputState);
-			ServerProcessOperation(ClientPayloadOperationData, false);
+			// First-frame guard for REMOTE player pawns: before the client's first move has
+			// populated SV_RemoteMoveExecutionAux.LastRawMove, OutputState is a default-constructed
+			// FGMC_PawnState whose InstancedStruct sync array is empty (Num()==0). The ruff guard
+			// above (!IsLocallyControlledServerPawn) only excludes the listen-server LOCAL pawn, so
+			// remote pawns still reach here and reading BI_OperationData (index 1) asserts
+			// out-of-bounds. No bound payload yet means there is no operation to process — skip.
+			if (OutputState.InstancedStruct.Num() > BoundQueueV2.BI_OperationData)
+			{
+				const FInstancedStruct ClientPayloadOperationData = GMCMovementComponent->GetBoundInstancedStruct(BoundQueueV2.BI_OperationData, OutputState);
+				ServerProcessOperation(ClientPayloadOperationData, false);
+			}
 		}
 		// [EXPERIMENTAL] Removed second GenPreLocalMoveExecution() call here:
 		// PreLocalMoveExecution already drained ClientQueuedOperations earlier in
@@ -243,22 +292,52 @@ void UGMC_AbilitySystemComponent::GenAncillaryTick(float DeltaTime, bool bIsComb
 	{
 		ProcessOperation(BoundQueueV2.OperationData, false);
 	}
-	
-	CheckActiveTagsChanged();
-	
-	ProcessAttributes(false);
-	
-	CheckAttributeChanged();
-	
-	CheckUnBoundAttributeChanged();
-	TickActiveCooldowns(DeltaTime);
+	} // GMAS_Anc_ProcessOperation
 
-	BoundQueueV2.GenAncillaryTick(DeltaTime);
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Anc_CheckActiveTagsChanged)
+		CheckActiveTagsChanged();
+	}
 
-	SendTaskDataToActiveAbility(false);
-	TickAncillaryActiveAbilities(DeltaTime);
-	
-	ClearAbilityAndTaskData();
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Anc_ProcessAttributes)
+		ProcessAttributes(false);
+	}
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Anc_CheckAttributeChanged)
+		CheckAttributeChanged();
+	}
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Anc_CheckUnBoundAttributeChanged)
+		CheckUnBoundAttributeChanged();
+	}
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Anc_TickActiveCooldowns)
+		TickActiveCooldowns(DeltaTime);
+	}
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Anc_BoundQueueV2_GenAncillaryTick)
+		BoundQueueV2.GenAncillaryTick(DeltaTime);
+	}
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Anc_SendTaskDataToActiveAbility)
+		SendTaskDataToActiveAbility(false);
+	}
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Anc_TickAncillaryActiveAbilities)
+		TickAncillaryActiveAbilities(DeltaTime);
+	}
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Anc_ClearAbilityAndTaskData)
+		ClearAbilityAndTaskData();
+	}
 
 	// Replay-burst diagnostic — consume the sticky flag set by any GenPredictionTick
 	// invocations during this frame's replay loop. AncillaryTick runs once per real
@@ -895,8 +974,13 @@ void UGMC_AbilitySystemComponent::GenPredictionTick(float DeltaTime)
 	}
 
 	// Drain any PredictedQueued operations buffered since the last tick.
-	DrainPendingPredictedOperations();
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Pred_DrainPredictedOps)
+		DrainPendingPredictedOperations();
+	}
 
+	{
+	TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Pred_ProcessOperation)
 	// Same listen-server guard as GenAncillaryTick: skip client payload processing
 	// for the locally-controlled host pawn (no client data submitted to itself).
 	// ruff: To fix crash when running standalone I changed IsLocallyControlledListenServerPawn to IsLocallyControlledServerPawn
@@ -911,28 +995,48 @@ void UGMC_AbilitySystemComponent::GenPredictionTick(float DeltaTime)
 	{
 		ProcessOperation(BoundQueueV2.OperationData, true);
 	}
-	
-	
-	ApplyStartingEffects();
+	} // GMAS_Pred_ProcessOperation
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Pred_ApplyStartingEffects)
+		ApplyStartingEffects();
+	}
 
 	// Purge "future" temporary modifiers on replay
 	if (GMCMovementComponent->CL_IsReplaying())
 	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Pred_PurgeTemporalModifiers)
 		for (FAttribute& Attribute : BoundAttributes.Attributes)
 		{
 			Attribute.PurgeTemporalModifier(ActionTimer);
 		}
 	}
-	
-	SendTaskDataToActiveAbility(true);
-	TickActiveAbilities(DeltaTime);
-	
-	TickActiveEffects(DeltaTime);
-	
-	ProcessAttributes(true);
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Pred_SendTaskDataToActiveAbility)
+		SendTaskDataToActiveAbility(true);
+	}
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Pred_TickActiveAbilities)
+		TickActiveAbilities(DeltaTime);
+	}
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Pred_TickActiveEffects)
+		TickActiveEffects(DeltaTime);
+	}
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Pred_ProcessAttributes)
+		ProcessAttributes(true);
+	}
 
 	// Abilities
-	CleanupStaleAbilities();
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Pred_CleanupStaleAbilities)
+		CleanupStaleAbilities();
+	}
 }
 
 void UGMC_AbilitySystemComponent::GenSimulationTick(float DeltaTime)
@@ -1081,6 +1185,7 @@ void UGMC_AbilitySystemComponent::InstantiateAttributes()
 			NewAttribute.Clamp.AbilityComponent = this;
 			NewAttribute.bIsGMCBound = AttributeData.bGMCBound;
 			NewAttribute.bStartFull = AttributeData.bStartFull;
+			NewAttribute.ValueCombineMode = AttributeData.ValueCombineMode;
 			NewAttribute.Init();
 			
 			if(AttributeData.bGMCBound){
@@ -2915,7 +3020,7 @@ bool UGMC_AbilitySystemComponent::ApplyAbilityEffect(TSubclassOf<UGMCAbilityEffe
 			return true;
 		}
 
-	case EGMCAbilityEffectQueueType::ServerTurbo:
+	case EGMCAbilityEffectQueueType::ServerInstantAttribute:
 		{
 			// Server-only fast path. Apply in the current tick without queuing through BoundQueueV2.
 			// Attribute modifiers reach clients via the standard FAttribute bound binding.
@@ -2924,7 +3029,7 @@ bool UGMC_AbilitySystemComponent::ApplyAbilityEffect(TSubclassOf<UGMCAbilityEffe
 			if (!HasAuthority())
 			{
 				UE_LOG(LogGMCAbilitySystem, Error,
-					TEXT("ServerTurbo apply rejected: %s called on non-authority. ServerTurbo is server-only."),
+					TEXT("ServerInstantAttribute apply rejected: %s called on non-authority. ServerInstantAttribute is server-only."),
 					*EffectClass->GetName());
 				return false;
 			}
@@ -2939,17 +3044,17 @@ bool UGMC_AbilitySystemComponent::ApplyAbilityEffect(TSubclassOf<UGMCAbilityEffe
 			if (!bIsInstant || bHasGrantedTags || bHasGrantedAbil)
 			{
 				ensureMsgf(bIsInstant,
-					TEXT("ServerTurbo expects EffectType::Instant on %s — non-Instant effects need the GMC bound queue to tick correctly. Falling back to ServerAuth."),
+					TEXT("ServerInstantAttribute expects EffectType::Instant on %s — non-Instant effects need the GMC bound queue to tick correctly. Falling back to ServerAuth."),
 					*EffectClass->GetName());
 				ensureMsgf(!bHasGrantedTags,
-					TEXT("ServerTurbo cannot grant tags on %s — GrantedTags route through the bound ActiveTags container and must use ServerAuth. Falling back to ServerAuth."),
+					TEXT("ServerInstantAttribute cannot grant tags on %s — GrantedTags route through the bound ActiveTags container and must use ServerAuth. Falling back to ServerAuth."),
 					*EffectClass->GetName());
 				ensureMsgf(!bHasGrantedAbil,
-					TEXT("ServerTurbo cannot grant abilities on %s — relies on the bound ability map. Falling back to ServerAuth."),
+					TEXT("ServerInstantAttribute cannot grant abilities on %s — relies on the bound ability map. Falling back to ServerAuth."),
 					*EffectClass->GetName());
 
 				UE_LOG(LogGMCAbilitySystem, Warning,
-					TEXT("ServerTurbo guards failed for %s (Instant=%d GrantedTags=%d GrantedAbil=%d) — falling back to ServerAuth."),
+					TEXT("ServerInstantAttribute guards failed for %s (Instant=%d GrantedTags=%d GrantedAbil=%d) — falling back to ServerAuth."),
 					*EffectClass->GetName(), bIsInstant ? 1 : 0, bHasGrantedTags ? 1 : 0, bHasGrantedAbil ? 1 : 0);
 
 				return ApplyAbilityEffect(EffectClass, InitializationData,
@@ -3485,16 +3590,16 @@ bool UGMC_AbilitySystemComponent::RemoveEffectByIdSafe(TArray<int> Ids, EGMCAbil
 				return true;
 			}
 
-		case EGMCAbilityEffectQueueType::ServerTurbo:
+		case EGMCAbilityEffectQueueType::ServerInstantAttribute:
 			{
-				// Symmetric to the ServerTurbo apply path: remove immediately on the server, no queue.
-				// Reached only if a caller explicitly requests it; the typical ServerTurbo apply target
+				// Symmetric to the ServerInstantAttribute apply path: remove immediately on the server, no queue.
+				// Reached only if a caller explicitly requests it; the typical ServerInstantAttribute apply target
 				// is EffectType::Instant which self-ends on the first Tick, so an external Remove is
 				// usually unnecessary. Kept for defense in depth.
 				if (!HasAuthority())
 				{
 					UE_LOG(LogGMCAbilitySystem, Error,
-						TEXT("ServerTurbo remove rejected on non-authority."));
+						TEXT("ServerInstantAttribute remove rejected on non-authority."));
 					return false;
 				}
 
