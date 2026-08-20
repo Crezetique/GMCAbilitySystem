@@ -281,6 +281,10 @@ public:
 	// Returns true if the server has confirmed this ability activation.
 	bool IsServerConfirmed() const { return bServerConfirmed; }
 
+	// Local activation time, in ActionTimer units. Diagnostics only: subtract it from the
+	// component's ActionTimer to age an instance that is holding a gate.
+	float GetClientStartTime() const { return ClientStartTime; }
+
 protected:
 
 	// How long to wait for server to confirm ability before cancelling on client
@@ -333,6 +337,10 @@ public:
 
 	
 	TMap<int, EGMCAbilityEffectQueueType> DeclaredEffect;
+
+	// EffectTag of each declared effect, kept as a fallback key. A replay rebuilds ActiveEffects from
+	// the server snapshot under new ids, so the declared id alone can stop resolving.
+	TMap<int, FGameplayTag> DeclaredEffectTags;
 
 		// Queries
 	UPROPERTY(EditDefaultsOnly, Category = "GMCAbilitySystem", meta=(DisplayName="Activation Tags Query"))
